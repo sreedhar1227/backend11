@@ -87,11 +87,24 @@ def generate_summary(transcript):
 
 def get_next_response(messages):
     client = initialize_client()
+    # Validate messages input
+    if not messages or not isinstance(messages, list):
+        raise ValueError("Messages must be a non-empty list")
+
+    # Ensure system prompt exists
+    system_prompt = next((m["content"] for m in messages if m.get("role") == "system"), "")
+    if not system_prompt:
+        raise ValueError("System prompt not found in messages")
+
     # Convert messages to Anthropic-compatible format
     anthropic_messages = []
-    for msg in messages[1:]:  # Skip system prompt
-        role = msg["role"]
-        content = msg["content"]
+    for msg in messages:
+        if msg.get("role") == "system":
+            continue  # Skip system prompt
+        role = msg.get("role")
+        content = msg.get("content")
+        if role not in ["user", "assistant"]:
+            continue
         if role == "assistant" and content.startswith('{'):
             try:
                 content = json.loads(content)["content"]
@@ -99,11 +112,15 @@ def get_next_response(messages):
                 pass
         anthropic_messages.append({"role": role, "content": content})
 
+    # Ensure at least one message
+    if not anthropic_messages:
+        anthropic_messages.append({"role": "user", "content": "Start the interview"})
+
     response = client.messages.create(
         model="claude-3-haiku-20240307",
         max_tokens=200,
         temperature=0.7,
-        system=messages[0]["content"],
+        system=system_prompt,
         messages=anthropic_messages,
         extra_headers={"anthropic-beta": "json-output"}
     )
@@ -149,8 +166,12 @@ def run_interview(state, user_answer=None, store_question_fn=None, store_user_re
                 system_prompt = SYSTEM_PROMPT_TEMPLATE.format(topics=', '.join(topics), summary=summary)
                 conversation_log = f"Lecture Summary: {summary}\nTopics: {', '.join(topics)}\n\n"
 
+            # Initialize messages with system prompt and default user message
             state.update({
-                "messages": [{"role": "system", "content": system_prompt}],
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": "Start the interview"}
+                ],
                 "question_count": 0,
                 "conversation_log": conversation_log,
                 "off_topic_count": 0,

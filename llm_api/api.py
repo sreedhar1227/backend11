@@ -114,13 +114,27 @@ def generate_llm_response(client, provider, messages, max_tokens=1000):
                 [m['content'] for m in messages if m['role'] == 'user' or m['role'] == 'system'],
                 generation_config={'max_output_tokens': max_tokens, 'temperature': 0.7}
             )
-            return json.loads(response.text)
+            # Try parsing as JSON; if it fails, assume it's a question
+            try:
+                return json.loads(response.text)
+            except json.JSONDecodeError:
+                if response.text.strip():
+                    return {"type": "question", "content": response.text.strip()}
+                else:
+                    raise ValueError("Empty response from Gemini")
         elif provider == 'claude':
+            # Extract system prompt and filter out system message
+            system_prompt = next((m['content'] for m in messages if m['role'] == 'system'), "")
+            filtered_messages = [m for m in messages if m['role'] != 'system']
+            # Ensure at least one message for Claude
+            if not filtered_messages:
+                filtered_messages.append({"role": "user", "content": "Start the interview"})
             response = client.messages.create(
                 model="claude-3-haiku-20240307",
                 max_tokens=max_tokens,
                 temperature=0.7,
-                messages=messages
+                system=system_prompt,
+                messages=filtered_messages
             )
             return json.loads(response.content[0].text)
     except Exception as e:
@@ -230,6 +244,7 @@ def start_interview(request):
             )
 
         messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": "Start the interview"})
         
         try:
             response = generate_llm_response(client, provider, messages)
