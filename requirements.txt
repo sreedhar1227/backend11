@@ -8,3 +8,5 @@ google-genai
 tiktoken
 django==4.2.7
 djangorestframework==3.14.0
+channels==4.0.0
+daphne==4.0.0

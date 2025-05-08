@@ -2,7 +2,7 @@
 import json
 from channels.generic.websocket import AsyncWebsocketConsumer
 from rest_framework import status
-from .api import initialize_llm_client, generate_llm_response, get_db_connection
+from .api import initialize_llm_client, generate_llm_response, get_db_connection, evaluate_answer, get_performance_rating
 from .serializers import InterviewStartSerializer, InterviewAnswerSerializer
 import uuid
 import logging
@@ -13,13 +13,19 @@ logger = logging.getLogger(__name__)
 class InterviewConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         self.session_id = self.scope['url_route']['kwargs']['session_id']
-        await self.accept()
         logger.debug(f"WebSocket connected for session: {self.session_id}")
+        await self.accept()
+        await self.send(text_data=json.dumps({
+            'status': 'success',
+            'message': f'WebSocket connected for session {self.session_id}',
+            'session_id': self.session_id
+        }))
 
     async def disconnect(self, close_code):
-        logger.debug(f"WebSocket disconnected for session: {self.session_id}")
+        logger.debug(f"WebSocket disconnected for session: {self.session_id} with close code: {close_code}")
 
     async def receive(self, text_data):
+        logger.debug(f"Received message for session {self.session_id}: {text_data}")
         try:
             data = json.loads(text_data)
             message_type = data.get('type')
@@ -35,7 +41,7 @@ class InterviewConsumer(AsyncWebsocketConsumer):
                 }))
 
         except Exception as e:
-            logger.error(f"Error in WebSocket receive: {str(e)}")
+            logger.error(f"Error in WebSocket receive for session {self.session_id}: {str(e)}")
             await self.send(text_data=json.dumps({
                 'status': 'error',
                 'message': str(e)
@@ -58,7 +64,6 @@ class InterviewConsumer(AsyncWebsocketConsumer):
                 }))
                 return
 
-            # MongoDB connection
             try:
                 mongo_client = MongoClient('mongodb://192.168.48.200:27017')
                 db = mongo_client['video_transcriptions']
@@ -116,11 +121,12 @@ class InterviewConsumer(AsyncWebsocketConsumer):
                 system_prompt = (
                     "You are a professional interviewer conducting an interview based on lecture transcripts.\n\n"
                     "Instructions:\n"
-                    "- Ask one question at a time based on the provided transcript.\n"
+                    "- Ask exactly 10 questions, one at a time, based on the provided transcript.\n"
                     "- Match the difficulty to an intermediate level suitable for a fresher.\n"
                     "- Use a professional tone.\n"
                     "- Output only a JSON object with 'type' ('question' or 'conclusion') and 'content' (question text or conclusion message).\n"
-                    "- If a response is off-topic or insufficient, guide the user back or ask for clarification.\n\n"
+                    "- If a response is off-topic or insufficient, guide the user back or ask for clarification.\n"
+                    "- After the 10th question, return a conclusion summarizing the interview.\n\n"
                     f"Transcript:\n{transcript}\n\nStart the interview now."
                 )
                 conversation_log = f"Lecture Interview\nTranscript Summary: {transcript[:100]}...\n\n"
@@ -147,12 +153,13 @@ class InterviewConsumer(AsyncWebsocketConsumer):
                 system_prompt = (
                     "You are a professional interviewer creating a customized interview.\n\n"
                     "Instructions:\n"
-                    f"- Ask one question at a time on the topic: \"{topic}\".\n"
+                    f"- Ask exactly 10 questions, one at a time, on the topic: \"{topic}\".\n"
                     f"- Match the difficulty level: \"{difficulty}\".\n"
                     f"- Tailor questions to a candidate with experience level: \"{experience}\".\n"
                     f"- Use a \"{tone}\" tone.\n"
                     "- Output only a JSON object with 'type' ('question' or 'conclusion') and 'content' (question text or conclusion message).\n"
-                    "- If a response is off-topic or insufficient, guide the user back or ask for clarification.\n\n"
+                    "- If a response is off-topic or insufficient, guide the user back or ask for clarification.\n"
+                    "- After the 10th question, return a conclusion summarizing the interview.\n\n"
                     "Start the interview now."
                 )
                 conversation_log = (
@@ -164,6 +171,7 @@ class InterviewConsumer(AsyncWebsocketConsumer):
                 )
 
             messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": "Start the interview"})
 
             try:
                 response = generate_llm_response(client, provider, messages)
@@ -178,7 +186,6 @@ class InterviewConsumer(AsyncWebsocketConsumer):
                 messages.append({"role": "assistant", "content": json.dumps(response)})
                 conversation_log += f"Question 1: {question}\n"
 
-                # Save to SQL Server
                 conn = get_db_connection()
                 cursor = conn.cursor()
                 cursor.execute(
@@ -201,7 +208,8 @@ class InterviewConsumer(AsyncWebsocketConsumer):
                     "question_count": 1,
                     "conversation_log": conversation_log,
                     "off_topic_count": 0,
-                    "provider": provider
+                    "provider": provider,
+                    "scores": []
                 }
 
                 await self.send(text_data=json.dumps({
@@ -243,6 +251,10 @@ class InterviewConsumer(AsyncWebsocketConsumer):
             question_count = state.get('question_count', 0)
             conversation_log = state.get('conversation_log', '')
             off_topic_count = state.get('off_topic_count', 0)
+            transcript = state.get('transcript', '')
+            mode = state.get('mode', '')
+            custom_info = state.get('custom_info', {})
+            scores = state.get('scores', [])
 
             try:
                 client = initialize_llm_client(provider)
@@ -253,15 +265,21 @@ class InterviewConsumer(AsyncWebsocketConsumer):
                 }))
                 return
 
+            # Get the current question
+            current_question = json.loads(messages[-1]['content'])['content'] if messages and messages[-1]['role'] == 'assistant' else ''
+
+            # Evaluate the answer
+            score, feedback = evaluate_answer(client, provider, current_question, answer, transcript, mode, custom_info)
+            scores.append({"question": current_question, "answer": answer, "score": score, "feedback": feedback})
+
             messages.append({"role": "user", "content": answer})
             conversation_log += f"Answer: {answer}\n"
 
-            # Update SQL Server
             conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO UserResponses (response_text) VALUES (?)",
-                (answer,)
+                "INSERT INTO UserResponses (response_text, score) VALUES (?, ?)",
+                (answer, score)
             )
             cursor.execute(
                 "UPDATE Conversations SET conversation_log = ? WHERE id = (SELECT MAX(id) FROM Conversations)",
@@ -271,11 +289,45 @@ class InterviewConsumer(AsyncWebsocketConsumer):
             cursor.close()
             conn.close()
 
-            # Prepare next question or conclude
             system_prompt = messages[0]['content']
             messages[0] = {"role": "system", "content": system_prompt}
 
             try:
+                if question_count >= 10:
+                    total_percentage = sum(score['score'] for score in scores) / len(scores) if scores else 0
+                    rating = get_performance_rating(total_percentage)
+                    conclusion_content = (
+                        f"Thank you for completing the interview. "
+                        f"Your total score is {total_percentage:.1f}% ({rating}). "
+                        f"Review your responses below:\n" +
+                        "\n".join(
+                            f"Question {i+1}: {score['question']} - Score: {score['score']}% - Feedback: {score['feedback']}"
+                            for i, score in enumerate(scores)
+                        )
+                    )
+                    conversation_log += f"Conclusion: {conclusion_content}\nTotal Percentage: {total_percentage:.1f}%\nRating: {rating}\n"
+
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE Conversations SET conversation_log = ?, total_percentage = ?, rating = ? WHERE id = (SELECT MAX(id) FROM Conversations)",
+                        (conversation_log, total_percentage, rating)
+                    )
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+
+                    await self.send(text_data=json.dumps({
+                        'status': 'success',
+                        'session_id': session_id,
+                        'type': 'conclusion',
+                        'content': conclusion_content,
+                        'total_percentage': total_percentage,
+                        'rating': rating,
+                        'scores': scores
+                    }))
+                    return
+
                 response = generate_llm_response(client, provider, messages)
                 messages.append({"role": "assistant", "content": json.dumps(response)})
 
@@ -283,7 +335,6 @@ class InterviewConsumer(AsyncWebsocketConsumer):
                     question_count += 1
                     conversation_log += f"Question {question_count}: {response['content']}\n"
 
-                    # Update SQL Server
                     conn = get_db_connection()
                     cursor = conn.cursor()
                     cursor.execute(
@@ -302,7 +353,8 @@ class InterviewConsumer(AsyncWebsocketConsumer):
                         "messages": messages,
                         "question_count": question_count,
                         "conversation_log": conversation_log,
-                        "off_topic_count": off_topic_count
+                        "off_topic_count": off_topic_count,
+                        "scores": scores
                     })
 
                     await self.send(text_data=json.dumps({
@@ -314,14 +366,22 @@ class InterviewConsumer(AsyncWebsocketConsumer):
                     }))
 
                 elif response['type'] == 'conclusion':
-                    conversation_log += f"Conclusion[token]: {response['content']}\n"
+                    total_percentage = sum(score['score'] for score in scores) / len(scores) if scores else 0
+                    rating = get_performance_rating(total_percentage)
+                    conclusion_content = (
+                        response['content'] + f"\nTotal Score: {total_percentage:.1f}% ({rating})\n" +
+                        "\n".join(
+                            f"Question {i+1}: {score['question']} - Score: {score['score']}% - Feedback: {score['feedback']}"
+                            for i, score in enumerate(scores)
+                        )
+                    )
+                    conversation_log += f"Conclusion: {conclusion_content}\nTotal Percentage: {total_percentage:.1f}%\nRating: {rating}\n"
 
-                    # Update SQL Server
                     conn = get_db_connection()
                     cursor = conn.cursor()
                     cursor.execute(
-                        "UPDATE Conversations SET conversation_log = ? WHERE id = (SELECT MAX(id) FROM Conversations)",
-                        (conversation_log,)
+                        "UPDATE Conversations SET conversation_log = ?, total_percentage = ?, rating = ? WHERE id = (SELECT MAX(id) FROM Conversations)",
+                        (conversation_log, total_percentage, rating)
                     )
                     conn.commit()
                     cursor.close()
@@ -331,7 +391,10 @@ class InterviewConsumer(AsyncWebsocketConsumer):
                         'status': 'success',
                         'session_id': session_id,
                         'type': 'conclusion',
-                        'content': response['content']
+                        'content': conclusion_content,
+                        'total_percentage': total_percentage,
+                        'rating': rating,
+                        'scores': scores
                     }))
 
                 else:

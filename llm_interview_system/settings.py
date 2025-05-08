@@ -25,7 +25,8 @@ SECRET_KEY = 'django-insecure-2_-kpgc=nb9(xsbd22(w_6c0-+po1f*xrq!t13#vlct!(me^*%
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['54.173.243.67', '192.168.48.30', 'localhost', '127.0.0.1']
+ALLOWED_HOSTS = ['183.82.108.211', 'localhost', '192.168.48.23']
+
 
 
 # Application definition
@@ -83,7 +84,7 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'llm_interview_system.wsgi.application'
 
-ASGI_APPLICATION = 'llm_interview_system.asgi.application'
+ASGI_APPLICATION = 'llm_interview_system.asgi:application'
 
 # Database
 # https://docs.djangoproject.com/en/4.2/ref/settings/#databases
@@ -97,9 +98,42 @@ DATABASES = {
 
 CHANNEL_LAYERS = {
     'default': {
-        'BACKEND': 'channels_redis.core.RedisChannelLayer',
-        'CONFIG': {
-            'hosts': [('127.0.0.1', 6379)],  # Adjust Redis host/port as needed
+        'BACKEND': 'channels.layers.InMemoryChannelLayer',
+    },
+}
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '{levelname} {asctime} {module} {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'file': {
+            'level': 'DEBUG',
+            'class': 'logging.FileHandler',
+            'filename': 'websocket_logs.log',
+            'formatter': 'verbose',
+        },
+        'console': {
+            'level': 'DEBUG',
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+        },
+    },
+    'loggers': {
+        'llm_api.consumers': {
+            'handlers': ['file', 'console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'channels': {
+            'handlers': ['file', 'console'],
+            'level': 'DEBUG',
+            'propagate': False,
         },
     },
 }
